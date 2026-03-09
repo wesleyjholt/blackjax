@@ -1,6 +1,7 @@
 """Test the tempered SMC steps and routine"""
 
 import functools
+from typing import NamedTuple
 
 import chex
 import jax
@@ -10,6 +11,7 @@ import numpy as np
 from absl.testing import absltest
 
 import blackjax
+import blackjax.smc.ess as smc_ess
 import blackjax.smc.resampling as resampling
 import blackjax.smc.solver as solver
 from blackjax import adaptive_tempered_smc, tempered_smc
@@ -168,6 +170,90 @@ def normal_logdensity_fn(x, chol_cov):
     )
     norm_y = jnp.sum(y * y, -1)
     return -(0.5 * norm_y + normalizing_constant)
+
+
+class DummyState(NamedTuple):
+    position: jax.Array
+
+
+class DummyInfo(NamedTuple):
+    logdensity: jax.Array
+
+
+def deterministic_init(position, logdensity_fn):
+    del logdensity_fn
+    return DummyState(position)
+
+
+def deterministic_step(rng_key, state, logdensity_fn, step_scale):
+    del rng_key
+    logdensity = logdensity_fn(state.position)
+    position = state.position + step_scale * logdensity
+    return DummyState(position), DummyInfo(logdensity)
+
+
+class AdaptiveTemperedConditionalResamplingTest(chex.TestCase):
+    @chex.variants(with_jit=True)
+    def test_weights_are_preserved_when_resampling_is_skipped(self):
+        particles = jnp.array([-2.0, -0.5, 0.5, 2.0])
+
+        tempering = adaptive_tempered_smc(
+            lambda x: 0.0,
+            lambda x: x,
+            deterministic_step,
+            deterministic_init,
+            extend_params({"step_scale": 1.0}),
+            resampling.systematic,
+            ess_reduction=0.95,
+            resampling_threshold=0.1,
+            num_mcmc_steps=1,
+        )
+
+        init_state = tempering.init(particles)
+        result, info = self.variant(tempering.step)(jax.random.key(0), init_state)
+
+        delta = np.asarray(result.tempering_param)
+        expected_log_weights = delta * np.asarray(particles)
+        expected_weights = np.exp(
+            expected_log_weights - jax.scipy.special.logsumexp(expected_log_weights)
+        )
+
+        np.testing.assert_allclose(result.weights, expected_weights, atol=1e-6)
+        np.testing.assert_allclose(
+            result.particles, (1.0 + result.tempering_param) * particles, atol=1e-6
+        )
+        np.testing.assert_allclose(
+            info.ess, smc_ess.ess(jnp.log(expected_weights)), atol=1e-6
+        )
+        assert not bool(np.asarray(info.did_resample))
+        np.testing.assert_array_equal(info.ancestors, np.arange(particles.shape[0]))
+
+    @chex.variants(with_jit=True)
+    def test_weights_reset_when_resampling_happens(self):
+        particles = jnp.array([-4.0, -1.0, 1.0, 4.0])
+
+        tempering = adaptive_tempered_smc(
+            lambda x: 0.0,
+            lambda x: x,
+            deterministic_step,
+            deterministic_init,
+            extend_params({"step_scale": 1.0}),
+            resampling.systematic,
+            ess_reduction=0.6,
+            resampling_threshold=0.95,
+            num_mcmc_steps=1,
+        )
+
+        init_state = tempering.init(particles)
+        result, info = self.variant(tempering.step)(jax.random.key(1), init_state)
+
+        np.testing.assert_allclose(
+            result.weights,
+            np.ones(particles.shape[0]) / particles.shape[0],
+            atol=1e-6,
+        )
+        assert bool(np.asarray(info.did_resample))
+        assert np.asarray(info.ess) < 0.95 * particles.shape[0]
 
 
 class NormalizingConstantTest(chex.TestCase):

@@ -66,11 +66,18 @@ class SMCInfo(NamedTuple):
         The log-likelihood increment due to the current step of the SMC algorithm.
     update_info: NamedTuple
         Additional information returned by the update function.
+    ess: float | Array | None
+        The effective sample size after reweighting and before any optional
+        resampling decision.
+    did_resample: bool | Array | None
+        Whether the transition performed a resampling step.
     """
 
     ancestors: Array
     log_likelihood_increment: float | Array
     update_info: NamedTuple
+    ess: float | Array | None = None
+    did_resample: bool | Array | None = None
 
 
 def init(particles: ArrayLikeTree, init_update_params: ArrayTree) -> SMCState:
@@ -162,9 +169,10 @@ def step(
 
     resampling_idx = resample_fn(resampling_key, state.weights, num_resampled)
     particles = jax.tree.map(lambda x: x[resampling_idx], state.particles)
+    update_parameters = jax.tree.map(lambda x: x[resampling_idx], state.update_parameters)
 
     keys = jax.random.split(updating_key, num_resampled)
-    particles, update_info = update_fn(keys, particles, state.update_parameters)
+    particles, update_info = update_fn(keys, particles, update_parameters)
 
     log_weights = weight_fn(particles)
     logsum_weights = logsumexp(log_weights)

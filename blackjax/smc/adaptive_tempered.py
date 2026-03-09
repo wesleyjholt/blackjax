@@ -15,12 +15,15 @@ from typing import Any, Callable, Optional
 
 import jax
 import jax.numpy as jnp
+from jax.scipy.special import logsumexp
 
 import blackjax.smc.base as base
 import blackjax.smc.ess as ess
+import blackjax.smc.from_mcmc as smc_from_mcmc
 import blackjax.smc.solver as solver
 import blackjax.smc.tempered as tempered
 from blackjax.base import SamplingAlgorithm
+from blackjax.smc.base import update_and_take_last
 from blackjax.types import Array, ArrayLikeTree, PRNGKey
 
 __all__ = ["build_kernel", "init", "as_top_level_api"]
@@ -32,7 +35,7 @@ def build_kernel(
     mcmc_step_fn: Callable,
     mcmc_init_fn: Callable,
     resampling_fn: Callable,
-    target_ess: float,
+    target_ess: Optional[float],
     root_solver: Callable = solver.dichotomy,
     **extra_parameters: dict[str, Any],
 ) -> Callable:
@@ -69,28 +72,73 @@ def build_kernel(
 
     """
 
-    def compute_delta(state: tempered.TemperedSMCState) -> float | Array:
+    ess_reduction = extra_parameters.pop("ess_reduction", None)
+    resampling_threshold = extra_parameters.pop("resampling_threshold", None)
+    update_strategy = extra_parameters.get("update_strategy", update_and_take_last)
+    update_particles_fn = extra_parameters.get("update_particles_fn", None)
+
+    if ess_reduction is not None and not 0.0 < ess_reduction < 1.0:
+        raise ValueError("ess_reduction must be in (0, 1).")
+    if resampling_threshold is not None and not 0.0 < resampling_threshold < 1.0:
+        raise ValueError("resampling_threshold must be in (0, 1).")
+    if ess_reduction is None and target_ess is None:
+        raise ValueError("target_ess must be provided when ess_reduction is None.")
+
+    use_pysmc_ess = ess_reduction is not None or resampling_threshold is not None
+
+    if use_pysmc_ess:
+        if update_particles_fn is not None:
+            raise ValueError(
+                "update_particles_fn is not supported with conditional resampling."
+            )
+        if update_strategy is not update_and_take_last:
+            raise ValueError(
+                "Conditional resampling currently supports only update_and_take_last."
+            )
+
+    def compute_delta(
+        state: tempered.TemperedSMCState, current_log_weights: Optional[Array] = None
+    ) -> float | Array:
         tempering_param = state.tempering_param
         max_delta = 1 - tempering_param
-        delta = ess.ess_solver(
-            jax.vmap(loglikelihood_fn),
-            state.particles,
-            target_ess,
-            max_delta,
-            root_solver,
-        )
+        batched_loglikelihood = jax.vmap(loglikelihood_fn)
+
+        if ess_reduction is None:
+            delta = ess.ess_solver(
+                batched_loglikelihood,
+                state.particles,
+                target_ess,
+                max_delta,
+                root_solver,
+                current_log_weights=current_log_weights,
+            )
+        else:
+            if current_log_weights is None:
+                current_log_weights = jnp.where(
+                    state.weights > 0, jnp.log(state.weights), -jnp.inf
+                )
+            delta = ess.ess_solver_by_ratio(
+                batched_loglikelihood,
+                state.particles,
+                ess_reduction,
+                max_delta,
+                root_solver,
+                current_log_weights,
+            )
         delta = jnp.clip(delta, 0.0, max_delta)
 
         return delta
 
-    tempered_kernel = tempered.build_kernel(
-        logprior_fn,
-        loglikelihood_fn,
-        mcmc_step_fn,
-        mcmc_init_fn,
-        resampling_fn,
-        **extra_parameters,  # type: ignore
-    )
+    tempered_kernel = None
+    if not use_pysmc_ess:
+        tempered_kernel = tempered.build_kernel(
+            logprior_fn,
+            loglikelihood_fn,
+            mcmc_step_fn,
+            mcmc_init_fn,
+            resampling_fn,
+            **extra_parameters,  # type: ignore
+        )
 
     def kernel(
         rng_key: PRNGKey,
@@ -98,11 +146,95 @@ def build_kernel(
         num_mcmc_steps: int | Array,
         mcmc_parameters: dict,
     ) -> tuple[tempered.TemperedSMCState, base.SMCInfo]:
-        delta = compute_delta(state)
+        if not use_pysmc_ess:
+            delta = compute_delta(state)
+            tempering_param = delta + state.tempering_param
+            assert tempered_kernel is not None
+            return tempered_kernel(
+                rng_key, state, num_mcmc_steps, tempering_param, mcmc_parameters
+            )
+
+        resampling_key, updating_key = jax.random.split(rng_key, 2)
+        num_particles = state.weights.shape[0]
+        current_log_weights = jnp.where(state.weights > 0, jnp.log(state.weights), -jnp.inf)
+        delta = compute_delta(state, current_log_weights)
         tempering_param = delta + state.tempering_param
-        return tempered_kernel(
-            rng_key, state, num_mcmc_steps, tempering_param, mcmc_parameters
+
+        batched_loglikelihood = jax.vmap(loglikelihood_fn)
+        log_weight_increment = delta * batched_loglikelihood(state.particles)
+        log_weights = current_log_weights + log_weight_increment
+        logsum_weights = logsumexp(log_weights)
+        normalized_log_weights = log_weights - logsum_weights
+        weights = jnp.exp(normalized_log_weights)
+        ess_value = ess.ess(normalized_log_weights)
+        normalizing_constant = logsum_weights
+
+        def tempered_logposterior_fn(position: ArrayLikeTree) -> float:
+            logprior = logprior_fn(position)
+            tempered_loglikelihood = tempering_param * loglikelihood_fn(position)
+            return logprior + tempered_loglikelihood
+
+        update_fn, num_resampled, unshared_mcmc_parameters = (
+            smc_from_mcmc.build_mcmc_update_fn(
+                mcmc_parameters,
+                mcmc_step_fn,
+                mcmc_init_fn,
+                tempered_logposterior_fn,
+                num_mcmc_steps,
+                num_particles,
+                update_strategy,
+            )
         )
+
+        if num_resampled != num_particles:
+            raise ValueError(
+                "Conditional resampling currently requires num_resampled == num_particles."
+            )
+
+        should_resample = (
+            jnp.asarray(True)
+            if resampling_threshold is None
+            else ess_value < resampling_threshold * num_particles
+        )
+
+        def resample_fn(_: None) -> tuple[ArrayLikeTree, dict, Array, Array, Array]:
+            ancestors = resampling_fn(resampling_key, weights, num_particles)
+            particles = jax.tree.map(lambda x: x[ancestors], state.particles)
+            parameters = jax.tree.map(lambda x: x[ancestors], unshared_mcmc_parameters)
+            new_weights = jnp.ones(num_particles) / num_particles
+            return particles, parameters, ancestors, new_weights, jnp.asarray(True)
+
+        def skip_resample(
+            _: None,
+        ) -> tuple[ArrayLikeTree, dict, Array, Array, Array]:
+            ancestors = jnp.arange(num_particles)
+            return (
+                state.particles,
+                unshared_mcmc_parameters,
+                ancestors,
+                weights,
+                jnp.asarray(False),
+            )
+
+        particles, update_parameters, ancestors, new_weights, did_resample = (
+            jax.lax.cond(should_resample, resample_fn, skip_resample, operand=None)
+        )
+        keys = jax.random.split(updating_key, num_particles)
+        particles, update_info = update_fn(keys, particles, update_parameters)
+
+        tempered_state = tempered.TemperedSMCState(
+            particles,
+            new_weights,
+            tempering_param,
+        )
+        info = base.SMCInfo(
+            ancestors,
+            normalizing_constant,
+            update_info,
+            ess_value,
+            did_resample,
+        )
+        return tempered_state, info
 
     return kernel
 
@@ -117,7 +249,7 @@ def as_top_level_api(
     mcmc_init_fn: Callable,
     mcmc_parameters: dict,
     resampling_fn: Callable,
-    target_ess: float,
+    target_ess: Optional[float] = None,
     root_solver: Callable = solver.dichotomy,
     num_mcmc_steps: int = 10,
     **extra_parameters: dict[str, Any],
@@ -149,7 +281,11 @@ def as_top_level_api(
         The number of times the MCMC kernel is applied to the particles per step,
         by default 10.
     **extra_parameters: dict [str, Any]
-        Additional parameters to pass to the kernel.
+        Additional parameters to pass to the kernel. Two optional parameters
+        enable pysmc-style ESS handling:
+        - ess_reduction: target ESS ratio relative to the current ESS.
+        - resampling_threshold: only resample when ESS falls below this
+          fraction of the number of particles.
 
     Returns
     -------

@@ -84,16 +84,14 @@ def build_kernel(
         logposterior_fn: Callable,
         log_weights_fn: Callable,
     ) -> tuple[smc.base.SMCState, smc.base.SMCInfo]:
-        unshared_mcmc_parameters, shared_mcmc_step_fn = unshared_parameters_and_step_fn(
-            mcmc_parameters, mcmc_step_fn
-        )
-
-        update_fn, num_resampled = update_strategy(
+        update_fn, num_resampled, unshared_mcmc_parameters = build_mcmc_update_fn(
+            mcmc_parameters,
+            mcmc_step_fn,
             mcmc_init_fn,
             logposterior_fn,
-            shared_mcmc_step_fn,
-            n_particles=state.weights.shape[0],
-            num_mcmc_steps=num_mcmc_steps,
+            num_mcmc_steps,
+            state.weights.shape[0],
+            update_strategy,
         )
 
         return smc.base.step(
@@ -106,3 +104,28 @@ def build_kernel(
         )
 
     return step
+
+
+def build_mcmc_update_fn(
+    mcmc_parameters: dict,
+    mcmc_step_fn: Callable,
+    mcmc_init_fn: Callable,
+    logposterior_fn: Callable,
+    num_mcmc_steps: int | Array,
+    n_particles: int | Array,
+    update_strategy: Callable = update_and_take_last,
+) -> tuple[Callable, int | Array, dict]:
+    """Build a batched MCMC update function and per-particle parameters."""
+    unshared_mcmc_parameters, shared_mcmc_step_fn = unshared_parameters_and_step_fn(
+        mcmc_parameters, mcmc_step_fn
+    )
+
+    update_fn, num_resampled = update_strategy(
+        mcmc_init_fn,
+        logposterior_fn,
+        shared_mcmc_step_fn,
+        n_particles=n_particles,
+        num_mcmc_steps=num_mcmc_steps,
+    )
+
+    return update_fn, num_resampled, unshared_mcmc_parameters

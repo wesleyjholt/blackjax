@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """All things related to SMC effective sample size"""
-from typing import Callable
+from typing import Callable, Optional
 
 import jax.numpy as jnp
 from jax.scipy.special import logsumexp
@@ -52,12 +52,36 @@ def log_ess(log_weights: Array) -> float | Array:
     return 2 * logsumexp(log_weights) - logsumexp(2 * log_weights)
 
 
+def _normalized_log_weights(weights: Array) -> float | Array:
+    """Safely convert normalized weights to log-weights."""
+    return jnp.where(weights > 0, jnp.log(weights), -jnp.inf)
+
+
+def _ess_solver(
+    current_log_weights: Array,
+    log_weight_increment: Array,
+    target_log_ess: float | Array,
+    max_delta: float | Array,
+    root_solver: Callable,
+) -> float | Array:
+    current_log_weights = jnp.ravel(current_log_weights)
+    log_weight_increment = jnp.ravel(log_weight_increment)
+
+    def fun_to_solve(delta: float | Array) -> Array:
+        log_weights = current_log_weights + jnp.nan_to_num(delta * log_weight_increment)
+        ess_val = log_ess(log_weights)
+        return ess_val - target_log_ess
+
+    return root_solver(fun_to_solve, 0.0, max_delta)
+
+
 def ess_solver(
     logdensity_fn: Callable,
     particles: ArrayLikeTree,
     target_ess: float | Array,
     max_delta: float | Array,
     root_solver: Callable,
+    current_log_weights: Optional[Array] = None,
 ) -> float | Array:
     """ESS solver for computing the next increment of SMC tempering.
 
@@ -75,6 +99,9 @@ def ess_solver(
         A solver to find the root of a function. Signature is
         root_solver(fun, min_delta, max_delta). Use e.g. dichotomy from
         blackjax.smc.solver.
+    current_log_weights: Array, optional
+        Current normalized log-weights. If omitted, all particles are assumed
+        to have equal weights.
 
     Returns
     -------
@@ -82,15 +109,38 @@ def ess_solver(
         The increment that solves for the target ESS.
 
     """
-    logprob = logdensity_fn(particles)
-    n_particles = logprob.shape[0]
+    log_weight_increment = jnp.ravel(logdensity_fn(particles))
+    n_particles = log_weight_increment.shape[0]
+    if current_log_weights is None:
+        current_log_weights = -jnp.log(n_particles) * jnp.ones(n_particles)
+    else:
+        current_log_weights = jnp.ravel(current_log_weights)
     target_val = jnp.log(n_particles * target_ess)
+    return _ess_solver(
+        current_log_weights,
+        log_weight_increment,
+        target_val,
+        max_delta,
+        root_solver,
+    )
 
-    def fun_to_solve(delta: float | Array) -> Array:
-        log_weights = jnp.nan_to_num(-delta * logprob)
-        ess_val = log_ess(log_weights)
 
-        return ess_val - target_val
-
-    estimated_delta = root_solver(fun_to_solve, 0.0, max_delta)
-    return estimated_delta
+def ess_solver_by_ratio(
+    logdensity_fn: Callable,
+    particles: ArrayLikeTree,
+    ess_reduction: float | Array,
+    max_delta: float | Array,
+    root_solver: Callable,
+    current_log_weights: Array,
+) -> float | Array:
+    """Solve for the next increment using an ESS target relative to the current ESS."""
+    log_weight_increment = jnp.ravel(logdensity_fn(particles))
+    current_log_weights = jnp.ravel(current_log_weights)
+    target_log_ess = log_ess(current_log_weights) + jnp.log(ess_reduction)
+    return _ess_solver(
+        current_log_weights,
+        log_weight_increment,
+        target_log_ess,
+        max_delta,
+        root_solver,
+    )
