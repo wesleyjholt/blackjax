@@ -1,12 +1,6 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: Git tag to release, for example v1.2.3
-        required: true
-        type: string
   release:
     types:
       - created
@@ -15,12 +9,8 @@ jobs:
   release-job:
     name: Build and publish on PyPi
     runs-on: ubuntu-latest
-    env:
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
     steps:
     - uses: actions/checkout@v3
-      with:
-        ref: ${{ env.RELEASE_TAG }}
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
@@ -32,7 +22,7 @@ jobs:
         python -m build
     - name: Check that the package version matches the Release name
       run: |
-        grep -Rq "^Version: ${RELEASE_TAG}$" blackjax.egg-info/PKG-INFO
+        grep -Rq "^Version: ${GITHUB_REF:10}$" blackjax.egg-info/PKG-INFO
     - name: Check sdist install and imports
       run: |
         mkdir -p test-sdist
@@ -57,8 +47,6 @@ jobs:
     name: Test install from PyPi
     needs: release-job
     runs-on: ubuntu-latest
-    env:
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
     steps:
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -68,4 +56,4 @@ jobs:
       run: sleep 240
     - name: Attempt install from PyPI
       run: |
-        pip install blackjax==${RELEASE_TAG}
+        pip install blackjax==${GITHUB_REF:10}

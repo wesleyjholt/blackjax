@@ -1,7 +1,6 @@
 name: Build the documentation
 
 on:
-  workflow_dispatch:
   pull_request:
     branches: [main]
 
