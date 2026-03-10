@@ -52,7 +52,7 @@
     <link rel="search" title="Search" href="../../../search.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.1.dev1+g0444634df" />
+  <meta name="docsearch:version" content="0.1.dev1+g66d576d75" />
   </head>
   
   
@@ -597,7 +597,8 @@
     <span class="n">num_output_particles</span> <span class="o">=</span> <span class="n">jax</span><span class="o">.</span><span class="n">tree_util</span><span class="o">.</span><span class="n">tree_flatten</span><span class="p">(</span><span class="n">particles</span><span class="p">)[</span><span class="mi">0</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
     <span class="n">new_weights</span> <span class="o">=</span> <span class="n">jax</span><span class="o">.</span><span class="n">lax</span><span class="o">.</span><span class="n">cond</span><span class="p">(</span>
         <span class="n">decision</span><span class="o">.</span><span class="n">resampled</span><span class="p">,</span>
-        <span class="k">lambda</span> <span class="n">_</span><span class="p">:</span> <span class="n">jnp</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="n">num_output_particles</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">weights</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span> <span class="o">/</span> <span class="n">num_output_particles</span><span class="p">,</span>
+        <span class="k">lambda</span> <span class="n">_</span><span class="p">:</span> <span class="n">jnp</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="n">num_output_particles</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">weights</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+        <span class="o">/</span> <span class="n">num_output_particles</span><span class="p">,</span>
         <span class="k">lambda</span> <span class="n">_</span><span class="p">:</span> <span class="n">weights</span><span class="p">,</span>
         <span class="n">operand</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span>
