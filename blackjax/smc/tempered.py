@@ -72,6 +72,7 @@ def build_kernel(
     resampling_fn: Callable,
     update_strategy: Callable = update_and_take_last,
     update_particles_fn: Optional[Callable] = None,
+    resampling_strategy: Optional[Callable] = None,
 ) -> Callable:
     """Build the base Tempered SMC kernel.
 
@@ -84,6 +85,13 @@ def build_kernel(
     and for which the density is easy to compute, and :math:`\\exp(-V(x))` is an
     unnormalized likelihood term for which :math:`V(x)` is easy to compute
     pointwise.
+
+    Each step targets a new tempering parameter by:
+    1. reweighting the current particle approximation with the likelihood
+       increment;
+    2. optionally resampling according to ``resampling_strategy``;
+    3. mutating the selected particles with an MCMC kernel targeting the new
+       tempered posterior.
 
     Parameters
     ----------
@@ -104,6 +112,10 @@ def build_kernel(
     update_particles_fn: Callable, optional
         Optional custom function to update particles. If None, uses
         smc_from_mcmc.build_kernel.
+    resampling_strategy: Callable, optional
+        Optional policy with signature
+        ``(rng_key, weights, num_samples) -> ResamplingDecision``. If omitted,
+        particles are resampled at every step.
 
     Returns
     -------
@@ -119,6 +131,7 @@ def build_kernel(
             mcmc_init_fn,
             resampling_fn,
             update_strategy,
+            resampling_strategy,
         )
         if update_particles_fn is None
         else update_particles_fn
@@ -152,7 +165,8 @@ def build_kernel(
         state: TemperedSMCState
             The new state of the tempered SMC algorithm.
         info: SMCInfo
-            Additional information on the SMC step.
+            Additional information on the SMC step, including ESS and whether
+            resampling occurred.
 
         """
         delta = tempering_param - state.tempering_param
@@ -162,7 +176,7 @@ def build_kernel(
 
         def tempered_logposterior_fn(position: ArrayLikeTree) -> float:
             logprior = logprior_fn(position)
-            tempered_loglikelihood = state.tempering_param * loglikelihood_fn(position)
+            tempered_loglikelihood = tempering_param * loglikelihood_fn(position)
             return logprior + tempered_loglikelihood
 
         smc_state, info = update_particles(
@@ -195,6 +209,7 @@ def as_top_level_api(
     num_mcmc_steps: Optional[int] = 10,
     update_strategy: Callable = update_and_take_last,
     update_particles_fn: Optional[Callable] = None,
+    resampling_strategy: Optional[Callable] = None,
 ) -> SamplingAlgorithm:
     """Implements the user interface for the Tempered SMC kernel.
 
@@ -222,6 +237,9 @@ def as_top_level_api(
     update_particles_fn: Callable, optional
         Optional custom function to update particles. If None, uses
         smc_from_mcmc.build_kernel.
+    resampling_strategy: Callable, optional
+        Optional policy controlling whether reweighted particles are resampled
+        before mutation. If omitted, resampling happens at every step.
 
     Returns
     -------
@@ -238,6 +256,7 @@ def as_top_level_api(
         resampling_fn,
         update_strategy,
         update_particles_fn,
+        resampling_strategy,
     )
 
     def init_fn(

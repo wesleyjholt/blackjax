@@ -49,6 +49,7 @@ def build_kernel(
     mcmc_init_fn: Callable,
     resampling_fn: Callable,
     update_strategy: Callable = update_and_take_last,
+    resampling_strategy: Callable | None = None,
 ) -> Callable:
     """Build an SMC step function from MCMC kernels.
 
@@ -68,6 +69,10 @@ def build_kernel(
     update_strategy: Callable
         Strategy to update particles using MCMC kernels, by default
         'update_and_take_last' from blackjax.smc.base.
+    resampling_strategy: Callable, optional
+        Optional resampling-decision policy. If omitted, the resulting SMC step
+        always resamples. Conditional ESS-based policies can be built with
+        ``blackjax.smc.resampling.ess_threshold``.
 
     Returns
     -------
@@ -103,6 +108,7 @@ def build_kernel(
             jax.vmap(log_weights_fn),
             resampling_fn,
             num_resampled,
+            resampling_strategy,
         )
 
     return step

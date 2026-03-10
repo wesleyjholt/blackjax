@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 from jax.scipy.special import logsumexp
 
+import blackjax.smc.resampling as resampling
 from blackjax.types import Array, ArrayLikeTree, ArrayTree, PRNGKey
 
 
@@ -66,11 +67,17 @@ class SMCInfo(NamedTuple):
         The log-likelihood increment due to the current step of the SMC algorithm.
     update_info: NamedTuple
         Additional information returned by the update function.
+    ess: float | Array
+        Effective sample size after reweighting and before any optional resampling.
+    resampled: bool | Array
+        Whether the resampling strategy selected a resampling move.
     """
 
     ancestors: Array
     log_likelihood_increment: float | Array
     update_info: NamedTuple
+    ess: float | Array
+    resampled: bool | Array
 
 
 def init(particles: ArrayLikeTree, init_update_params: ArrayTree) -> SMCState:
@@ -102,13 +109,15 @@ def step(
     weight_fn: Callable,
     resample_fn: Callable,
     num_resampled: Optional[int] = None,
+    resampling_strategy: Optional[Callable] = None,
 ) -> tuple[SMCState, SMCInfo]:
     """General SMC sampling step.
 
     `update_fn` here corresponds to the Markov kernel $M_{t+1}$, and `weight_fn`
-    corresponds to the potential function $G_t$. We first use `update_fn` to
-    generate new particles from the current ones, weigh these particles using
-    `weight_fn` and resample them with `resample_fn`.
+    corresponds to the potential function $G_t$. The step first reweights the
+    current particles, then delegates the resampling decision to
+    ``resampling_strategy`` and finally mutates the selected particles with
+    ``update_fn``.
 
     The `update_fn` and `weight_fn` functions must be batched by the caller either
     using `jax.vmap` or `jax.pmap`.
@@ -117,13 +126,14 @@ def step(
 
     .. code::
 
-        M_t: update_fn
         G_t: weight_fn
-        R_t: resample_fn
-        idx = R_t(weights)
+        R_t: resampling_strategy
+        M_t: update_fn
+        weights_t = normalize(log(w_{t-1}) + G_t(x_{t-1}))
+        idx = R_t(weights_t)
         x_t = x_tm1[idx]
         x_{t+1} = M_t(x_t)
-        weights = G_t(x_{t+1})
+        weights_{t+1} = uniform if resampled else weights_t
 
     Parameters
     ----------
@@ -137,12 +147,18 @@ def step(
     weight_fn: Callable
         Function that assigns a weight to the particles.
     resample_fn: Callable
-        Function that resamples the particles.
+        Particle resampling function. This is used by the default strategy and by
+        any custom strategy that chooses to draw new ancestors.
     num_resampled: int, optional
         The number of particles to resample. This can be used to implement
         Waste-Free SMC :cite:p:`dau2020waste`, in which case we resample a number
         :math:`M<N` of particles, and the update function is in charge of returning
         :math:`N` samples.
+    resampling_strategy: Callable, optional
+        Callable with signature
+        ``(rng_key, weights, num_samples) -> ResamplingDecision``.
+        If ``None``, the step always resamples using ``resample_fn``. Strategies
+        can implement conditional resampling based on ESS or other diagnostics.
 
     Returns
     -------
@@ -150,7 +166,8 @@ def step(
         The new SMCState containing updated particles and weights.
     info: SMCInfo
         An `SMCInfo` object that contains extra information about the SMC
-        transition.
+        transition, including the ESS before optional resampling and whether the
+        strategy triggered resampling.
 
     """
     updating_key, resampling_key = jax.random.split(rng_key, 2)
@@ -160,19 +177,33 @@ def step(
     if num_resampled is None:
         num_resampled = num_particles
 
-    resampling_idx = resample_fn(resampling_key, state.weights, num_resampled)
-    particles = jax.tree.map(lambda x: x[resampling_idx], state.particles)
+    if resampling_strategy is None:
+        resampling_strategy = resampling.always(resample_fn)
 
+    log_weights = jnp.log(state.weights) + weight_fn(state.particles)
+    logsum_weights = logsumexp(log_weights)
+    normalizing_constant = logsum_weights
+    weights = jnp.exp(log_weights - logsum_weights)
+    decision = resampling_strategy(resampling_key, weights, num_resampled)
+
+    particles = jax.tree.map(lambda x: x[decision.ancestors], state.particles)
     keys = jax.random.split(updating_key, num_resampled)
     particles, update_info = update_fn(keys, particles, state.update_parameters)
 
-    log_weights = weight_fn(particles)
-    logsum_weights = logsumexp(log_weights)
-    normalizing_constant = logsum_weights - jnp.log(num_particles)
-    weights = jnp.exp(log_weights - logsum_weights)
+    num_output_particles = jax.tree_util.tree_flatten(particles)[0][0].shape[0]
+    new_weights = jax.lax.cond(
+        decision.resampled,
+        lambda _: jnp.ones(num_output_particles, dtype=weights.dtype) / num_output_particles,
+        lambda _: weights,
+        operand=None,
+    )
 
-    return SMCState(particles, weights, state.update_parameters), SMCInfo(
-        resampling_idx, normalizing_constant, update_info
+    return SMCState(particles, new_weights, state.update_parameters), SMCInfo(
+        decision.ancestors,
+        normalizing_constant,
+        update_info,
+        decision.ess,
+        decision.resampled,
     )
 
 

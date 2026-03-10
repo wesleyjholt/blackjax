@@ -117,6 +117,54 @@ class TemperedSMCTest(SMCLinearRegressionTestCase):
         assert iterates[1] >= iterates[0]
 
     @chex.variants(with_jit=True)
+    def test_adaptive_tempered_smc_reports_resampling_decision(self):
+        num_particles = 32
+
+        x_data = np.random.normal(0, 1, size=(100, 1))
+        y_data = 3 * x_data + np.random.normal(size=x_data.shape)
+        observations = {"x": x_data, "preds": y_data}
+
+        def logprior_fn(x):
+            return (
+                stats.expon.logpdf(jnp.exp(x[0]), 0, 1) + x[0] + stats.norm.logpdf(x[1])
+            )
+
+        loglikelihood_fn = lambda x: self.logdensity_fn(*x, **observations)
+
+        smc_state_init = [
+            np.log(np.random.exponential(1, num_particles)),
+            3 + 2 * np.random.randn(num_particles),
+        ]
+
+        hmc_kernel = blackjax.hmc.build_kernel()
+        hmc_init = blackjax.hmc.init
+        hmc_parameters = extend_params(
+            {
+                "step_size": 10e-2,
+                "inverse_mass_matrix": jnp.eye(2),
+                "num_integration_steps": 5,
+            }
+        )
+
+        tempering = adaptive_tempered_smc(
+            logprior_fn,
+            loglikelihood_fn,
+            hmc_kernel,
+            hmc_init,
+            hmc_parameters,
+            resampling.systematic,
+            0.8,
+            num_mcmc_steps=1,
+            resampling_threshold=0.99,
+        )
+        init_state = tempering.init(smc_state_init)
+        state, info = self.variant(tempering.step)(self.key, init_state)
+
+        assert hasattr(info, "ess")
+        assert hasattr(info, "resampled")
+        assert info.ess <= num_particles
+
+    @chex.variants(with_jit=True)
     def test_fixed_schedule_tempered_smc(self):
         (
             init_particles,

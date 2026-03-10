@@ -93,6 +93,28 @@ class SMCEffectiveSampleSizeTest(chex.TestCase):
         ess_val = ess.ess(-delta * potential(particles))
         np.testing.assert_allclose(ess_val, target_ess * N, atol=1e-1, rtol=1e-2)
 
+    @chex.all_variants(with_pmap=False)
+    def test_ess_solver_with_existing_weights(self):
+        num_particles = 1000
+        potential = jax.vmap(lambda x: jnp.square(x))
+        particles = np.random.normal(0, 1, size=(num_particles,))
+        current_weights = jax.nn.log_softmax(jnp.linspace(-2.0, 2.0, num_particles))
+        target_ess = 0.4
+
+        delta = self.variant(
+            functools.partial(
+                ess.ess_solver,
+                potential,
+                target_ess=target_ess,
+                max_delta=1.0,
+                root_solver=solver.dichotomy,
+                current_log_weights=current_weights,
+            )
+        )(particles)
+
+        ess_val = ess.ess(current_weights - delta * potential(particles))
+        np.testing.assert_allclose(ess_val, target_ess * num_particles, atol=1e-1, rtol=1e-2)
+
 
 if __name__ == "__main__":
     absltest.main()

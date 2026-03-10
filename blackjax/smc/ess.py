@@ -14,6 +14,7 @@
 """All things related to SMC effective sample size"""
 from typing import Callable
 
+import jax
 import jax.numpy as jnp
 from jax.scipy.special import logsumexp
 
@@ -58,6 +59,7 @@ def ess_solver(
     target_ess: float | Array,
     max_delta: float | Array,
     root_solver: Callable,
+    current_log_weights: Array | None = None,
 ) -> float | Array:
     """ESS solver for computing the next increment of SMC tempering.
 
@@ -85,12 +87,23 @@ def ess_solver(
     logprob = logdensity_fn(particles)
     n_particles = logprob.shape[0]
     target_val = jnp.log(n_particles * target_ess)
+    if current_log_weights is None:
+        current_log_weights = jnp.zeros_like(logprob)
+    current_ess = log_ess(current_log_weights)
+
+    def if_already_below_target(_: None) -> float | Array:
+        return max_delta
 
     def fun_to_solve(delta: float | Array) -> Array:
-        log_weights = jnp.nan_to_num(-delta * logprob)
+        log_weights = current_log_weights + jnp.nan_to_num(-delta * logprob)
         ess_val = log_ess(log_weights)
 
         return ess_val - target_val
 
-    estimated_delta = root_solver(fun_to_solve, 0.0, max_delta)
+    estimated_delta = jax.lax.cond(
+        current_ess <= target_val,
+        if_already_below_target,
+        lambda _: root_solver(fun_to_solve, 0.0, max_delta),
+        operand=None,
+    )
     return estimated_delta

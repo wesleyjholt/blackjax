@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sequential Monte Carlo"
+  short_description: "Build and debug JAX/BlackJAX SMC workflows."
+  default_prompt: "Use $sequential-monte-carlo to build, debug, or extend sequential Monte Carlo code in the local BlackJAX checkout."

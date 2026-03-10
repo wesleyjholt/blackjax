@@ -13,12 +13,32 @@
 # limitations under the License.
 """All things resampling."""
 from functools import partial
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
 
 from blackjax.types import Array, PRNGKey
+
+
+class ResamplingDecision(NamedTuple):
+    """Decision returned by a resampling strategy.
+
+    Parameters
+    ----------
+    ancestors
+        Indices of the parent particles selected for mutation.
+    resampled
+        Boolean flag indicating whether the strategy performed a true resampling
+        move. When this is ``False``, ``ancestors`` is typically the identity map.
+    ess
+        Effective sample size of the normalized weights that were used to make
+        the decision.
+    """
+
+    ancestors: Array
+    resampled: Array
+    ess: float | Array
 
 
 def _resampling_func(
@@ -178,3 +198,57 @@ def _sorted_uniforms(rng_key: PRNGKey, n: int) -> Array:
     us = jax.random.uniform(rng_key, (n + 1,))
     z = jnp.cumsum(-jnp.log(us))
     return z[:-1] / z[-1]
+
+
+def _ess_from_normalized_weights(weights: Array) -> float | Array:
+    return 1.0 / jnp.sum(jnp.square(weights))
+
+
+def always(resampling_fn: Callable) -> Callable:
+    """Build a strategy that always resamples."""
+
+    def strategy(rng_key: PRNGKey, weights: Array, num_samples: int) -> ResamplingDecision:
+        ancestors = resampling_fn(rng_key, weights, num_samples)
+        return ResamplingDecision(
+            ancestors=ancestors,
+            resampled=jnp.array(True),
+            ess=_ess_from_normalized_weights(weights),
+        )
+
+    return strategy
+
+
+def ess_threshold(threshold: float | Array, resampling_fn: Callable) -> Callable:
+    """Build a strategy that resamples when ESS drops below a threshold.
+
+    The threshold is interpreted as a fraction of the total number of particles.
+    If ``num_samples`` differs from the number of particles, resampling is forced.
+    This keeps the strategy compatible with update schemes that require drawing a
+    strict subset of parents.
+
+    The returned strategy reports the ESS used for the decision and returns the
+    identity ancestry when resampling is skipped.
+    """
+
+    def strategy(rng_key: PRNGKey, weights: Array, num_samples: int) -> ResamplingDecision:
+        num_particles = weights.shape[0]
+        ess = _ess_from_normalized_weights(weights)
+        should_resample = jnp.logical_or(
+            jnp.array(num_samples != num_particles),
+            ess < threshold * num_particles,
+        )
+
+        ancestors = jax.lax.cond(
+            should_resample,
+            lambda _: resampling_fn(rng_key, weights, num_samples),
+            lambda _: jnp.arange(num_samples, dtype=jnp.int32),
+            operand=None,
+        )
+
+        return ResamplingDecision(
+            ancestors=ancestors,
+            resampled=should_resample,
+            ess=ess,
+        )
+
+    return strategy

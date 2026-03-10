@@ -66,6 +66,62 @@ class SMCTest(chex.TestCase):
         np.testing.assert_allclose(std, 1.0, atol=1e-1)
 
     @chex.variants(with_jit=True)
+    def test_conditional_resampling_skips_when_ess_is_high(self):
+        num_particles = 8
+        init_particles = jnp.arange(num_particles, dtype=jnp.float32)
+        state = init(init_particles, {})
+
+        def identity_update(keys, particles, params):
+            del keys, params
+            return particles, ()
+
+        def near_uniform_log_weights(particles):
+            del particles
+            return jnp.zeros(num_particles)
+
+        new_state, info = self.variant(step, static_argnums=(2, 3, 4, 6))(
+            self.key,
+            state,
+            identity_update,
+            near_uniform_log_weights,
+            resampling.systematic,
+            None,
+            resampling.ess_threshold(0.5, resampling.systematic),
+        )
+
+        np.testing.assert_array_equal(info.ancestors, jnp.arange(num_particles))
+        np.testing.assert_allclose(new_state.weights, jnp.ones(num_particles) / num_particles)
+        assert not bool(info.resampled)
+
+    @chex.variants(with_jit=True)
+    def test_conditional_resampling_triggers_when_ess_is_low(self):
+        num_particles = 8
+        init_particles = jnp.arange(num_particles, dtype=jnp.float32)
+        state = init(init_particles, {})
+
+        def identity_update(keys, particles, params):
+            del keys, params
+            return particles, ()
+
+        def skewed_log_weights(particles):
+            del particles
+            return jnp.array([0.0] + [-10.0] * (num_particles - 1))
+
+        new_state, info = self.variant(step, static_argnums=(2, 3, 4, 6))(
+            self.key,
+            state,
+            identity_update,
+            skewed_log_weights,
+            resampling.systematic,
+            None,
+            resampling.ess_threshold(0.9, resampling.systematic),
+        )
+
+        np.testing.assert_allclose(new_state.weights, jnp.ones(num_particles) / num_particles)
+        assert bool(info.resampled)
+        assert info.ess < 0.9 * num_particles
+
+    @chex.variants(with_jit=True)
     def test_smc_waste_free(self):
         p = 500
         num_particles = 1000

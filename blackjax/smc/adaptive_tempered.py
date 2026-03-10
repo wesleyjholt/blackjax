@@ -18,6 +18,7 @@ import jax.numpy as jnp
 
 import blackjax.smc.base as base
 import blackjax.smc.ess as ess
+import blackjax.smc.resampling as resampling
 import blackjax.smc.solver as solver
 import blackjax.smc.tempered as tempered
 from blackjax.base import SamplingAlgorithm
@@ -34,6 +35,7 @@ def build_kernel(
     resampling_fn: Callable,
     target_ess: float,
     root_solver: Callable = solver.dichotomy,
+    resampling_strategy: Optional[Callable] = None,
     **extra_parameters: dict[str, Any],
 ) -> Callable:
     """Build a Tempered SMC step using an adaptive schedule.
@@ -53,10 +55,17 @@ def build_kernel(
         Resampling function (from blackjax.smc.resampling).
     target_ess: float | Array
         Target effective sample size (ESS) to determine the next tempering
-        parameter.
+        parameter. This keeps the existing BlackJAX semantics: the solver seeks
+        the next tempering increment such that the ESS after reweighting matches
+        ``target_ess * num_particles`` whenever possible.
     root_solver: Callable, optional
         The solver used to adaptively compute the temperature given a target number
         of effective samples. By default, blackjax.smc.solver.dichotomy.
+    resampling_strategy: Callable, optional
+        Optional policy controlling whether particles are resampled after
+        reweighting at the new temperature. If omitted, callers of
+        ``build_kernel`` get the unconditional-resampling behavior from the base
+        tempered kernel.
     **extra_parameters : dict[str, Any]
         Additional parameters to pass to tempered.build_kernel.
 
@@ -78,6 +87,7 @@ def build_kernel(
             target_ess,
             max_delta,
             root_solver,
+            current_log_weights=jnp.log(state.weights),
         )
         delta = jnp.clip(delta, 0.0, max_delta)
 
@@ -89,6 +99,7 @@ def build_kernel(
         mcmc_step_fn,
         mcmc_init_fn,
         resampling_fn,
+        resampling_strategy=resampling_strategy,
         **extra_parameters,  # type: ignore
     )
 
@@ -120,6 +131,8 @@ def as_top_level_api(
     target_ess: float,
     root_solver: Callable = solver.dichotomy,
     num_mcmc_steps: int = 10,
+    resampling_threshold: float | Array = 0.9,
+    resampling_strategy: Optional[Callable] = None,
     **extra_parameters: dict[str, Any],
 ) -> SamplingAlgorithm:
     """Implements the user interface for the Adaptive Tempered SMC kernel.
@@ -148,13 +161,23 @@ def as_top_level_api(
     num_mcmc_steps: int, optional
         The number of times the MCMC kernel is applied to the particles per step,
         by default 10.
+    resampling_threshold: float | Array, optional
+        ESS threshold used to decide whether resampling is triggered after
+        reweighting. The threshold is interpreted as a fraction of the number of
+        particles, and defaults to ``0.9``.
+    resampling_strategy: Callable, optional
+        Optional custom resampling-decision policy. If provided, it overrides
+        ``resampling_threshold`` and receives normalized weights for the
+        reweighted particle system.
     **extra_parameters: dict [str, Any]
         Additional parameters to pass to the kernel.
 
     Returns
     -------
     SamplingAlgorithm
-        A ``SamplingAlgorithm`` instance with init and step methods.
+        A ``SamplingAlgorithm`` instance with init and step methods. The returned
+        step info contains the pre-resampling ESS and a boolean flag indicating
+        whether resampling happened.
 
     """
     kernel = build_kernel(
@@ -165,6 +188,11 @@ def as_top_level_api(
         resampling_fn,
         target_ess,
         root_solver,
+        (
+            resampling.ess_threshold(resampling_threshold, resampling_fn)
+            if resampling_strategy is None
+            else resampling_strategy
+        ),
         **extra_parameters,
     )
 
