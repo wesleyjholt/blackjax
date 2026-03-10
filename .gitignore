@@ -108,3 +108,4 @@ venv_blackjax/
 .coverage
 coverage.xml
 coverage
+.agents/
