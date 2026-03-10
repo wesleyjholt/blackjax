@@ -113,7 +113,9 @@ class SMCEffectiveSampleSizeTest(chex.TestCase):
         )(particles)
 
         ess_val = ess.ess(current_weights - delta * potential(particles))
-        np.testing.assert_allclose(ess_val, target_ess * num_particles, atol=1e-1, rtol=1e-2)
+        np.testing.assert_allclose(
+            ess_val, target_ess * num_particles, atol=1e-1, rtol=1e-2
+        )
 
 
 if __name__ == "__main__":

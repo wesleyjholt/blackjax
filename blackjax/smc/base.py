@@ -193,7 +193,8 @@ def step(
     num_output_particles = jax.tree_util.tree_flatten(particles)[0][0].shape[0]
     new_weights = jax.lax.cond(
         decision.resampled,
-        lambda _: jnp.ones(num_output_particles, dtype=weights.dtype) / num_output_particles,
+        lambda _: jnp.ones(num_output_particles, dtype=weights.dtype)
+        / num_output_particles,
         lambda _: weights,
         operand=None,
     )

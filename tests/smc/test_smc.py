@@ -90,7 +90,9 @@ class SMCTest(chex.TestCase):
         )
 
         np.testing.assert_array_equal(info.ancestors, jnp.arange(num_particles))
-        np.testing.assert_allclose(new_state.weights, jnp.ones(num_particles) / num_particles)
+        np.testing.assert_allclose(
+            new_state.weights, jnp.ones(num_particles) / num_particles
+        )
         assert not bool(info.resampled)
 
     @chex.variants(with_jit=True)
@@ -117,7 +119,9 @@ class SMCTest(chex.TestCase):
             resampling.ess_threshold(0.9, resampling.systematic),
         )
 
-        np.testing.assert_allclose(new_state.weights, jnp.ones(num_particles) / num_particles)
+        np.testing.assert_allclose(
+            new_state.weights, jnp.ones(num_particles) / num_particles
+        )
         assert bool(info.resampled)
         assert info.ess < 0.9 * num_particles
 

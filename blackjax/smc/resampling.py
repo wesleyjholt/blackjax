@@ -207,7 +207,9 @@ def _ess_from_normalized_weights(weights: Array) -> float | Array:
 def always(resampling_fn: Callable) -> Callable:
     """Build a strategy that always resamples."""
 
-    def strategy(rng_key: PRNGKey, weights: Array, num_samples: int) -> ResamplingDecision:
+    def strategy(
+        rng_key: PRNGKey, weights: Array, num_samples: int
+    ) -> ResamplingDecision:
         ancestors = resampling_fn(rng_key, weights, num_samples)
         return ResamplingDecision(
             ancestors=ancestors,
@@ -230,7 +232,9 @@ def ess_threshold(threshold: float | Array, resampling_fn: Callable) -> Callable
     identity ancestry when resampling is skipped.
     """
 
-    def strategy(rng_key: PRNGKey, weights: Array, num_samples: int) -> ResamplingDecision:
+    def strategy(
+        rng_key: PRNGKey, weights: Array, num_samples: int
+    ) -> ResamplingDecision:
         num_particles = weights.shape[0]
         ess = _ess_from_normalized_weights(weights)
         should_resample = jnp.logical_or(
