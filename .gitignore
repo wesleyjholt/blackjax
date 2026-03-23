@@ -109,3 +109,5 @@ venv_blackjax/
 coverage.xml
 coverage
 .agents/
+
+workspace/
