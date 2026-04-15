@@ -78,11 +78,31 @@ def build_kernel(
 
     """
 
+    # ``ess.ess_solver`` computes
+    #     log_weights = current_log_weights + (-delta * logprob)
+    # internally. For this to match the actual reweighting performed by
+    # ``tempered.build_kernel`` (``log_weights_fn = delta * loglikelihood_fn``,
+    # see blackjax/smc/tempered.py), the argument passed here must be a
+    # *potential* — i.e. ``-loglikelihood_fn`` — so that the two negatives
+    # cancel. Passing the raw ``loglikelihood_fn`` flips the sign of the
+    # in-solver reweighting relative to reality, which for any left-skewed
+    # likelihood causes the solver to underestimate how fast ESS drops and
+    # return slightly-too-large deltas. The test convention in
+    # ``tests/smc/test_smc_ess.py`` confirms this: those tests define
+    # ``potential = -logpdf`` before calling ``ess_solver``. Define the
+    # vmapped potential once here so the closure is stable across calls
+    # (rebuilding it inside ``compute_delta`` caused unnecessary JAX trace
+    # churn for non-JITted callers).
+    def _neg_loglikelihood(position: ArrayLikeTree) -> Array:
+        return -loglikelihood_fn(position)
+
+    potential_fn = jax.vmap(_neg_loglikelihood)
+
     def compute_delta(state: tempered.TemperedSMCState) -> float | Array:
         tempering_param = state.tempering_param
         max_delta = 1 - tempering_param
         delta = ess.ess_solver(
-            jax.vmap(loglikelihood_fn),
+            potential_fn,
             state.particles,
             target_ess,
             max_delta,

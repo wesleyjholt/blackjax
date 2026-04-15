@@ -118,6 +118,89 @@ class SMCEffectiveSampleSizeTest(chex.TestCase):
         )
 
     @chex.all_variants(with_pmap=False)
+    def test_adaptive_tempered_compute_delta_sign_consistency(self):
+        """Regression for the sign mismatch between ``ess_solver`` and ``tempered``.
+
+        ``blackjax.smc.ess.ess_solver`` expects a *potential* argument
+        (negative log density) so that its internal
+        ``log_weights = current_log_weights + (-delta * logprob)`` matches the
+        actual reweighting performed by ``blackjax.smc.tempered``
+        (``log_weights_fn = delta * loglikelihood_fn``, see tempered.py). The
+        old code in ``blackjax/smc/adaptive_tempered.py`` passed the raw
+        ``loglikelihood_fn`` — inverting the sign.
+
+        This test runs the patched ``adaptive_tempered.compute_delta`` path
+        (via ``blackjax.adaptive_tempered_smc``) on a left-skewed likelihood
+        and asserts that after applying the returned delta with the same
+        reweighting formula ``tempered.py`` uses, the resulting ESS matches
+        the caller's ``target_ess * N`` within tolerance. Before the sign fix
+        the two disagreed, so the solver returned a delta too large for the
+        real reweighting.
+        """
+        import blackjax
+        import blackjax.smc.resampling as resampling_mod
+
+        num_particles = 2000
+        target_ess = 0.75
+
+        # Left-skewed loglik: mean near -10, long negative tail, max near 0.
+        def logprior_fn(x):
+            return jnp.sum(-0.5 * x * x - 0.5 * jnp.log(2 * jnp.pi))
+
+        def loglikelihood_fn(x):
+            return -5.0 * jnp.sum((x - 0.5) ** 2)
+
+        rng = jax.random.key(202604)
+        rng, init_key = jax.random.split(rng)
+        init_particles = jax.random.normal(init_key, shape=(num_particles, 3))
+
+        # Identity MCMC kernel: we only care about the reweighting step. Use
+        # a single RMH mutation with a tiny proposal so mutation is a no-op
+        # and ESS is determined entirely by reweighting.
+        import blackjax.mcmc.random_walk as rw
+
+        rmh_kernel = rw.build_additive_step()
+
+        def mcmc_step_fn(rng_key, state, logdensity_fn, proposal_chol):
+            return rmh_kernel(
+                rng_key, state, logdensity_fn, rw.normal(proposal_chol)
+            )
+
+        tempering = blackjax.adaptive_tempered_smc(
+            logprior_fn,
+            loglikelihood_fn,
+            mcmc_step_fn,
+            rw.init,
+            {"proposal_chol": 1e-8 * jnp.eye(3)[None, ...]},
+            resampling_mod.systematic,
+            target_ess=target_ess,
+            num_mcmc_steps=1,
+            resampling_threshold=0.0,  # disable resampling: isolate reweight
+        )
+        state = tempering.init(init_particles)
+
+        # Snapshot pre-step weights and compute what ESS *should* be after
+        # reweighting by the chosen delta using tempered.py's +delta * loglik
+        # formula.
+        log_w_before = jnp.log(state.weights)
+        loglik_at_particles = jax.vmap(loglikelihood_fn)(state.particles)
+
+        rng, step_key = jax.random.split(rng)
+        new_state, _info = self.variant(tempering.step)(step_key, state)
+
+        delta = float(new_state.tempering_param - state.tempering_param)
+        assert delta > 0.0, f"expected positive delta, got {delta}"
+
+        # Apply tempered.py's reweighting formula to pre-step weights.
+        log_w_after_via_tempered = log_w_before + delta * loglik_at_particles
+        ess_after_via_tempered = float(np.exp(ess.log_ess(log_w_after_via_tempered)))
+
+        target_val = target_ess * num_particles
+        np.testing.assert_allclose(
+            ess_after_via_tempered, target_val, rtol=0.05, atol=10.0,
+        )
+
+    @chex.all_variants(with_pmap=False)
     def test_ess_solver_does_not_teleport_when_drift_below_target(self):
         """Regression for the ``if_already_below_target`` short-circuit.
 
