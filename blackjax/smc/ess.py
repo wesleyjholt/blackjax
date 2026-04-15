@@ -91,14 +91,34 @@ def ess_solver(
         current_log_weights = jnp.zeros_like(logprob)
     current_ess = log_ess(current_log_weights)
 
-    def if_already_below_target(_: None) -> float | Array:
-        return max_delta
-
     def fun_to_solve(delta: float | Array) -> Array:
         log_weights = current_log_weights + jnp.nan_to_num(-delta * logprob)
         ess_val = log_ess(log_weights)
 
         return ess_val - target_val
+
+    def if_already_below_target(_: None) -> float | Array:
+        # Cumulative weight drift has put ``current_ess`` at or below the
+        # caller's ``target_val``. Because reweighting only decreases ESS, the
+        # original target is unreachable. The naive fallback is to return
+        # ``max_delta``, but that is the *worst* possible choice in adaptive
+        # tempered SMC: it teleports the tempering parameter to 1.0 in a
+        # single step, leaving the inner MCMC kernel calibrated for the old
+        # intermediate target and producing near-zero acceptance at the
+        # final step (see ``test_ess_solver_does_not_teleport_when_drift_below_target``
+        # for a regression that fails on the old code).
+        #
+        # Instead, retry the dichotomy against a relaxed target that preserves
+        # ``0.99 * current_ess`` — still a small, valid tempering step, avoids
+        # both the ``max_delta`` blowup and the dichotomy NaN, and keeps SMC
+        # making monotone progress.
+        relaxed_target = current_ess + jnp.log(0.99)
+
+        def fun_to_solve_relaxed(delta: float | Array) -> Array:
+            log_weights = current_log_weights + jnp.nan_to_num(-delta * logprob)
+            return log_ess(log_weights) - relaxed_target
+
+        return root_solver(fun_to_solve_relaxed, 0.0, max_delta)
 
     estimated_delta = jax.lax.cond(
         current_ess <= target_val,

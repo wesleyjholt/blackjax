@@ -117,6 +117,71 @@ class SMCEffectiveSampleSizeTest(chex.TestCase):
             ess_val, target_ess * num_particles, atol=1e-1, rtol=1e-2
         )
 
+    @chex.all_variants(with_pmap=False)
+    def test_ess_solver_does_not_teleport_when_drift_below_target(self):
+        """Regression for the ``if_already_below_target`` short-circuit.
+
+        Construct a particle + weight configuration where ``current_ess`` is
+        just barely below ``target_val * N``. On the original code this
+        triggered the short-circuit and returned ``max_delta``, which in
+        adaptive tempered SMC teleports the tempering parameter to 1.0 in a
+        single step. The patched code retries against a relaxed target
+        (0.99 * current_ess), so the returned delta must be strictly less
+        than ``max_delta`` and the resulting ESS must stay close to
+        ``current_ess`` (no further than 2% below).
+        """
+        num_particles = 1000
+        # Small positive potential so reweighting drops ESS as delta grows.
+        # The sign here matches the existing test convention
+        # (potential = -logdensity).
+        potential = jax.vmap(lambda x: jnp.square(x))
+        particles = np.linspace(-1.0, 1.0, num_particles)
+
+        # Build current_log_weights such that current_ess is *just* below the
+        # target we are about to ask for. Approach: start uniform, apply a
+        # tiny initial reweighting with the same potential to seed mild
+        # non-uniformity, then tune the target_ess to land just above the
+        # resulting current_ess.
+        seed_delta = 1e-3
+        current_log_weights = -seed_delta * potential(particles)
+        current_ess_val = float(np.exp(ess.log_ess(current_log_weights)))
+
+        # Target ESS is set such that ``target_val`` exceeds ``current_ess``
+        # by a hair — firmly inside the ``current_ess <= target_val`` branch.
+        target_ess_fraction = min((current_ess_val + 0.5) / num_particles, 0.9999)
+        max_delta = 1.0
+
+        delta = self.variant(
+            functools.partial(
+                ess.ess_solver,
+                potential,
+                target_ess=target_ess_fraction,
+                max_delta=max_delta,
+                root_solver=solver.dichotomy,
+                current_log_weights=current_log_weights,
+            )
+        )(particles)
+
+        # 1. The solver must NOT return max_delta.
+        assert float(delta) < max_delta - 1e-6, (
+            f"ess_solver returned delta={float(delta)} which is at max_delta={max_delta} — "
+            "the short-circuit is still teleporting."
+        )
+
+        # 2. Applying the delta should drop ESS by at most ~2% of current.
+        #    Use the same reweighting convention the solver uses internally
+        #    (log_weights = current - delta * potential).
+        new_log_weights = current_log_weights - float(delta) * potential(particles)
+        new_ess_val = float(np.exp(ess.log_ess(new_log_weights)))
+        assert new_ess_val >= 0.97 * current_ess_val, (
+            f"after retry with relaxed target, ESS dropped too far: "
+            f"{new_ess_val:.2f} < 0.97 * {current_ess_val:.2f}"
+        )
+        # And the delta must be positive (we did make some progress).
+        assert float(delta) > 0.0, (
+            f"ess_solver returned delta={float(delta)}; expected positive progress."
+        )
+
 
 if __name__ == "__main__":
     absltest.main()

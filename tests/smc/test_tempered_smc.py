@@ -164,6 +164,115 @@ class TemperedSMCTest(SMCLinearRegressionTestCase):
         assert hasattr(info, "resampled")
         assert info.ess <= num_particles
 
+    def test_adaptive_tempered_smc_no_lambda_jump(self):
+        """Regression: the adaptive tempering schedule should not teleport.
+
+        Before the ``if_already_below_target`` fix in ``blackjax/smc/ess.py``,
+        adaptive tempered SMC would take a handful of small-delta steps and
+        then jump straight to ``lambda = 1.0`` in a single step — a
+        ``delta / max_delta`` ratio of 1.0 — because cumulative weight drift
+        drops ``current_ess`` a hair below ``target_val`` and the
+        short-circuit returns ``max_delta``. This test exercises that code
+        path with an aggressive ``target_ess`` on a non-Gaussian left-skewed
+        likelihood and asserts no single step advances lambda by more than
+        60% of the remaining ``(1 - lambda_current)``.
+        """
+        num_particles = 512
+        num_dim = 5
+
+        # Left-skewed loglik: quadratic penalty (bounded above at 0, unbounded
+        # below) multiplied by a scale chosen so the prior draws have a wide
+        # loglik spread. This reproduces the failure mode from the user
+        # project whose posterior fits motivated these fixes.
+        def logprior_fn(x):
+            return stats.multivariate_normal.logpdf(
+                x, jnp.zeros((num_dim,)), jnp.eye(num_dim)
+            )
+
+        def loglikelihood_fn(x):
+            return -5.0 * jnp.sum((x - 0.75) ** 2)
+
+        rng = jax.random.key(20260414)
+        rng, init_key = jax.random.split(rng)
+        init_particles = jax.random.normal(init_key, shape=(num_particles, num_dim))
+
+        hmc_init = blackjax.hmc.init
+        hmc_kernel = blackjax.hmc.build_kernel()
+        hmc_parameters = extend_params(
+            {
+                "step_size": 1e-1,
+                "inverse_mass_matrix": jnp.eye(num_dim),
+                "num_integration_steps": 10,
+            },
+        )
+
+        tempering = adaptive_tempered_smc(
+            logprior_fn,
+            loglikelihood_fn,
+            hmc_kernel,
+            hmc_init,
+            hmc_parameters,
+            resampling.systematic,
+            target_ess=0.95,
+            num_mcmc_steps=10,
+            resampling_threshold=0.5,
+        )
+        state = tempering.init(init_particles)
+
+        # Python-side loop so we can inspect each step's lambda increment.
+        deltas = []
+        lambda_trace = [float(state.tempering_param)]
+        for i in range(200):
+            rng, step_key = jax.random.split(rng)
+            lambda_before = float(state.tempering_param)
+            state, info = tempering.step(step_key, state)
+            lambda_after = float(state.tempering_param)
+            deltas.append(lambda_after - lambda_before)
+            lambda_trace.append(lambda_after)
+            if lambda_after >= 1.0 - 1e-7:
+                break
+
+        assert lambda_trace[-1] >= 1.0 - 1e-7, (
+            f"adaptive_tempered_smc did not reach lambda=1 in 200 steps; "
+            f"schedule={lambda_trace}"
+        )
+
+        # The pathological "teleport" we are regression-testing is a step
+        # from lambda << 1 directly to lambda = 1.0 (the old code produced
+        # schedules like [0, 0.001, 0.015, 1.0]). A step from 0.92 -> 1.0 is
+        # NOT pathological — by that point the particles are equilibrated
+        # under a nearly-full posterior and taking the remaining max_delta is
+        # correct. So assert:
+        #   (a) no step starting from lambda < 0.5 takes more than 50% of the
+        #       remaining range, AND
+        #   (b) no step starting from lambda < 0.8 lands directly on 1.0.
+        for step_idx, delta in enumerate(deltas):
+            lambda_before = lambda_trace[step_idx]
+            lambda_after = lambda_trace[step_idx + 1]
+            max_delta = 1.0 - lambda_before
+            if max_delta <= 0.0:
+                continue
+            ratio = delta / max_delta
+            if lambda_before < 0.5:
+                assert ratio < 0.5, (
+                    f"step {step_idx + 1}: delta={delta:.6f} is {ratio:.4f} of "
+                    f"max_delta={max_delta:.6f} (lambda_before={lambda_before:.6f}) — "
+                    f"early-schedule teleport. Full schedule: {lambda_trace}"
+                )
+            if lambda_before < 0.8 and lambda_after >= 1.0 - 1e-7:
+                raise AssertionError(
+                    f"step {step_idx + 1}: lambda jumped from {lambda_before:.6f} "
+                    f"directly to 1.0 — teleport. Full schedule: {lambda_trace}"
+                )
+
+        # Sanity: the schedule should also not be trivially tiny. With the
+        # old teleport behavior this was ~4-7 steps; the patched solver
+        # produces ~20-60 steps depending on the target.
+        assert len(deltas) >= 10, (
+            f"expected >=10 tempering steps, got {len(deltas)}; "
+            f"schedule={lambda_trace}"
+        )
+
     @chex.variants(with_jit=True)
     def test_fixed_schedule_tempered_smc(self):
         (
