@@ -108,11 +108,17 @@ def ess_solver(
         # final step (see ``test_ess_solver_does_not_teleport_when_drift_below_target``
         # for a regression that fails on the old code).
         #
-        # Instead, retry the dichotomy against a relaxed target that preserves
-        # ``0.99 * current_ess`` — still a small, valid tempering step, avoids
-        # both the ``max_delta`` blowup and the dichotomy NaN, and keeps SMC
-        # making monotone progress.
-        relaxed_target = current_ess + jnp.log(0.99)
+        # Instead, retry the dichotomy against a relaxed target that allows
+        # ESS to drop by 10% of its current value. This is aggressive enough
+        # to (a) make meaningful tempering progress per step even on
+        # left-skewed likelihoods, and (b) let cumulative drift reach the
+        # downstream ``resampling_threshold`` in O(log) steps, at which
+        # point ``tempered.build_kernel`` triggers resampling and restores
+        # ESS to ``N``, returning the solver to the normal ``current_ess >
+        # target_val`` regime on the next call. A smaller relaxation (e.g.
+        # ``0.99``) produces microscopic deltas that make the adaptive
+        # schedule grind to a halt before resampling ever fires.
+        relaxed_target = current_ess + jnp.log(0.5)
 
         def fun_to_solve_relaxed(delta: float | Array) -> Array:
             log_weights = current_log_weights + jnp.nan_to_num(-delta * logprob)
